@@ -41,6 +41,7 @@ Item {
     name: "ImapSend"
     when: windowShown
 
+    property var sendHandle: null
     property bool callbackDone: false
     property var callbackPayload: null
     property string callbackError: ""
@@ -73,7 +74,7 @@ Item {
       callbackPayload = null
       callbackError = ""
       harness.observedSentCopyWarning = ""
-      client.sendMessage(Mail.buildSendPayload({
+      sendHandle = client.sendMessage(Mail.buildSendPayload({
         from: "me@example.org",
         to: "friend@example.net",
         subject: "Saved in Sent",
@@ -115,6 +116,19 @@ Item {
       compare(Mail.decodeBase64Url(fields[3]), sentMessage,
         "the saved copy must be the exact message accepted by SMTP")
 
+      append.finished(0, "", "")
+      compare(harness.observedSentCopyWarning, "")
+    }
+
+    function test_cancelling_completed_delivery_keeps_the_background_copy() {
+      sendMessage()
+      processFor("smtp ").finished(0, "", "")
+      compare(callbackDone, true)
+      var append = processFor("imap-append ")
+      verify(append)
+      client.abortRequest(sendHandle)
+      compare(append.running, true,
+        "The completed delivery handle must not own the background copy")
       append.finished(0, "", "")
       compare(harness.observedSentCopyWarning, "")
     }
