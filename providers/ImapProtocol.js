@@ -85,7 +85,7 @@ var PRESETS = [
     imapHost: "outlook.office365.com", imapPort: 993,
     smtpHost: "smtp-mail.outlook.com", smtpPort: 587,
     note: "Microsoft has withdrawn password sign-in for personal accounts; "
-      + "a work or school account may still allow it."
+      + "go back and pick Outlook to sign in with Microsoft instead."
   },
   {
     id: "yahoo",
@@ -479,11 +479,17 @@ function uidListCommand() {
   return "UID FETCH 1:* (UID)"
 }
 
-// An interactive search does not need every UID before it can begin. This one
-// short FETCH learns the immutable upper boundary of the mailbox; an empty
-// mailbox answers with no FETCH row at all.
-function uidCeilingCommand() {
-  return "UID FETCH *:* (UID)"
+// An interactive search does not need every UID before it can begin: the UID
+// of the last message by sequence number is the mailbox's upper boundary. The
+// obvious `UID FETCH *:*` cannot be used through curl, which takes a FETCH of
+// one message for a body fetch and routes its untagged answer where the
+// transport never sees it. A range that starts with a number passes through
+// intact; the count it starts from comes from STATUS on an earlier connection,
+// and running the range up to `*` rather than back to the count keeps a
+// message delivered between the two from sitting above the ceiling unseen.
+function topUidCommand(count) {
+  var n = Math.floor(Number(count))
+  return isFinite(n) && n >= 1 ? "FETCH " + n + ":* (UID)" : ""
 }
 
 // A SEARCH over a known UID snapshot can be split without using message
@@ -650,6 +656,37 @@ function draftSaveResult(replaceError) {
     saved: true,
     warning: detail === "" ? ""
       : "The updated draft was saved, but the old copy could not be removed: " + detail
+  }
+}
+
+// The folder a sent copy is filed in: the server's own Sent, learned from
+// LIST like every folder name is. An empty answer means the server named
+// none, and names are never guessed — a client that made one up would create
+// folders rather than find them.
+function sentFolder(special) {
+  return (special || {})["\\sent"] || ""
+}
+
+// curl's upload-flags names flags as bare words rather than as the
+// parenthesised list IMAP puts on the APPEND line. A draft keeps its \Draft
+// marker; a sent copy arrives seen, because its author has read it.
+function appendFlagWords(sent) {
+  return sent === true ? "seen" : "draft"
+}
+
+// What a finished send reports about the copy the mailbox keeps. The message
+// itself is out either way, so a copy that did not land is a warning carried
+// on a success, never a failure of the send. An empty folder name stands for
+// every reason no folder was known — the server listed none, or the listing
+// could not be asked — because what the user does about them is the same:
+// nothing.
+function sentCopyResult(folder, filed) {
+  if (String(folder || "") === "")
+    return { sent: true, warning: "Sent, but no Sent folder was found to file a copy in" }
+  return {
+    sent: true,
+    warning: filed === true ? ""
+      : "Sent, but the copy for the Sent folder could not be saved"
   }
 }
 
@@ -1013,6 +1050,82 @@ function decodeMailbox(name) {
     at = close + 1
   }
   return out
+}
+
+// The other direction, for a name the user typed that is about to be sent in
+// CREATE or RENAME: printable US-ASCII passes through, "&" is spelled "&-",
+// and everything else goes into a base64 run of its UTF-16 code units with
+// "," standing in for "/" and no padding — RFC 3501 section 5.1.3. What comes
+// back from LIST decodes to the same text, and `tests/test_imap.js` holds the
+// round trip.
+function encodeMailbox(name) {
+  var text = String(name === undefined || name === null ? "" : name)
+  var out = ""
+  var run = ""
+  function flush() {
+    if (run === "") return
+    var bytes = []
+    for (var i = 0; i < run.length; i++) {
+      var code = run.charCodeAt(i)
+      bytes.push((code >> 8) & 0xff, code & 0xff)
+    }
+    var alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+,"
+    var encoded = ""
+    for (var b = 0; b < bytes.length; b += 3) {
+      var n = (bytes[b] << 16) | ((b + 1 < bytes.length ? bytes[b + 1] : 0) << 8)
+        | (b + 2 < bytes.length ? bytes[b + 2] : 0)
+      encoded += alphabet.charAt((n >> 18) & 63) + alphabet.charAt((n >> 12) & 63)
+      if (b + 1 < bytes.length) encoded += alphabet.charAt((n >> 6) & 63)
+      if (b + 2 < bytes.length) encoded += alphabet.charAt(n & 63)
+    }
+    out += "&" + encoded + "-"
+    run = ""
+  }
+  for (var at = 0; at < text.length; at++) {
+    var ch = text.charAt(at)
+    var code = text.charCodeAt(at)
+    if (code >= 0x20 && code <= 0x7e) {
+      flush()
+      out += ch === "&" ? "&-" : ch
+    } else {
+      run += ch
+    }
+  }
+  flush()
+  return out
+}
+
+// The three commands that change the folder list. A name the server already
+// has travels exactly as LIST spelled it — the wire name, encoded once by
+// the server — and a name the user typed is encoded here. Encoding a wire
+// name again turns its "&" into "&-" and names a folder that does not exist.
+// A RENAME carries every folder beneath the old name with it, which is what
+// moving a folder under another parent is.
+// Refuse an unrepresentable identity before quoting or encoding can change it.
+function validFolderName(value) {
+  var text = String(value === undefined || value === null ? "" : value)
+  if (text === "" || /[\x00-\x1f\x7f]/.test(text)) return false
+  for (var i = 0; i < text.length; i++) {
+    var code = text.charCodeAt(i)
+    if (code >= 0xd800 && code <= 0xdbff) {
+      var next = text.charCodeAt(++i)
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false
+    } else if (code >= 0xdc00 && code <= 0xdfff) return false
+  }
+  return true
+}
+
+function createCommand(name) {
+  return validFolderName(name) ? "CREATE " + quote(encodeMailbox(name)) : ""
+}
+
+function renameCommand(fromWire, toName) {
+  if (!validFolderName(fromWire) || !validFolderName(toName)) return ""
+  return "RENAME " + quote(fromWire) + " " + quote(encodeMailbox(toName))
+}
+
+function deleteCommand(wireName) {
+  return validFolderName(wireName) ? "DELETE " + quote(wireName) : ""
 }
 
 // The SPECIAL-USE attributes this plugin cares about, mapped to the folder the

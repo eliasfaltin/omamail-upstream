@@ -1,5 +1,6 @@
 import QtQuick 2.15
 import QtTest 1.3
+import qs.Commons
 import "../.." as Omamail
 
 // Where the window is, is a history. Every page is an entry on it, every Back
@@ -244,6 +245,9 @@ Item {
     function kinds() { return app.navKinds.join(",") }
 
     function init() {
+      // A test that failed part way through its scales must not leave the next
+      // one measuring at somebody else's.
+      Style.spacingScale = 1
       mailService.log = []
       mailService.lastSavedDraft = null
       mailService.refuseMove = false
@@ -302,6 +306,52 @@ Item {
       app.back()
       compare(kinds(), "list")
       compare(mailService.count("discard"), 1, "and only that once")
+    }
+
+    // Settings opens over Drafts, whether a draft is being previewed or the
+    // list is showing, and stays open: nothing in the draft path resets the
+    // stack under it.
+    function test_settings_opens_over_the_drafts_folder() {
+      mailService.mailboxKey = "drafts"
+      app.cursorId = "draft-7"
+      app.openMessage("draft-7")
+      compare(app.currentView, "reader")
+      app.openSettings()
+      wait(30)
+      compare(app.page, "settings", "settings over a previewed draft")
+      compare(app.showSettings, true)
+      app.back()
+      wait(30)
+      compare(app.currentView, "reader")
+      app.backToList()
+      app.openSettings()
+      wait(30)
+      compare(app.page, "settings", "settings over the drafts list")
+      app.back()
+      mailService.mailboxKey = "inbox"
+    }
+
+    // The menu's Settings row goes where the key goes. The row is activated
+    // rather than clicked: the runner delivers no press into a popup's
+    // overlay, so a click here would prove nothing either way.
+    function test_the_menu_settings_row_opens_settings() {
+      mailService.mailboxKey = "drafts"
+      var menu = named(app, "app-menu")
+      verify(menu, "the app menu is there")
+      menu.openAt(40, 40)
+      wait(60)
+      verify(menu.opened)
+      var row = null
+      for (var i = 0; i < menu.menuRows.length; i++)
+        if (menu.menuRows[i].objectName === "app-menu-settings") row = menu.menuRows[i]
+      verify(row && row.visible, "the Settings row is drawn")
+      row.activated()
+      wait(60)
+      compare(menu.opened, false, "the menu closed")
+      compare(app.page, "settings", "and Settings opened")
+      compare(mailService.mailboxKey, "drafts", "the mailbox was left alone")
+      app.back()
+      mailService.mailboxKey = "inbox"
     }
 
     function test_a_draft_over_the_reader_returns_to_the_reader() {
@@ -375,6 +425,78 @@ Item {
       tryCompare(switcher, "opened", true)
       compare(trigger.selected, true, "the trigger stays selected while its popup is open")
       switcher.close()
+    }
+
+    // The address is what this line is about and the key hints are a nicety
+    // beside it, so the room goes to the address first.
+    function test_the_status_address_keeps_its_room_from_the_key_hints() {
+      // The right of the line carries a notice or the hints, never both, so a
+      // status an earlier test left standing is a line with no hints on it.
+      mailService.actionStatus = ""
+      mailService.lastError = ""
+      app.notice = ""
+      mailService.syncedLabel = "Synced just now"
+      waitForRendering(app)
+
+      var label = named(app, "status-account-label")
+      var hints = named(app, "status-key-hints")
+      verify(label && hints)
+      compare(label.text, "me@example.com \u00b7 just now")
+      verify(!label.truncated, "a short address and its age fit beside the hints")
+      verify(hints.visible, "and the hints keep the room they were left")
+
+      // Grown rather than measured: how many characters fit is a fact about
+      // the theme's font, and what is being asserted is which of the two gives
+      // way, whatever that number turns out to be.
+      var address = "a.long.standing.mailbox.address@example.org"
+      for (var i = 0; i < 20 && hints.visible; i++) {
+        address = "longer." + address
+        mailService.accountEmail = address
+        waitForRendering(app)
+      }
+      verify(!hints.visible, "the hints step off the line rather than cutting the address")
+      verify(!label.truncated, "and the address keeps every character it has room for")
+
+      mailService.accountEmail = "me@example.com"
+      waitForRendering(app)
+      verify(hints.visible, "the hints come back when the address gives the room up")
+
+      // The one thing that still pushes the address over, because a notice is
+      // what the window most needs to say.
+      var slot = label.parent.parent
+      var wide = slot.width
+      mailService.actionStatus = "Moved to Archive"
+      waitForRendering(app)
+      verify(slot.width < wide, "a notice takes the right of the line back")
+
+      mailService.actionStatus = ""
+      mailService.syncedLabel = ""
+      waitForRendering(app)
+    }
+
+    // The box around the address pads it by one number and measures itself by
+    // another, and `Style.space` rounds each on its own. At the shell's
+    // `base-size 14` the two disagree by a pixel, and a Text a pixel short of
+    // its own content is elided however wide the window is — which is what put
+    // "just n..." on the line and made it look like a fixed width.
+    function test_the_status_address_is_not_a_pixel_short_of_its_box() {
+      var label = named(app, "status-account-label")
+      verify(label)
+      mailService.syncedLabel = "Synced just now"
+
+      // Every scale a rounded 4 and a rounded 8 can fall out of step on, and a
+      // couple where they agree, because the assertion is the same either way.
+      var scales = [1, 0.9, 7 / 6, 1.25, 1.375, 1.4, 1.5, 1.9]
+      for (var i = 0; i < scales.length; i++) {
+        Style.spacingScale = scales[i]
+        waitForRendering(app)
+        verify(!label.truncated,
+          "the address fits its own box at spacing scale " + scales[i])
+      }
+
+      Style.spacingScale = 1
+      mailService.syncedLabel = ""
+      waitForRendering(app)
     }
 
     function test_header_creation_actions_keep_their_labels() {
@@ -456,6 +578,59 @@ Item {
       mailService.anyAccountReady = true
       waitForRendering(app)
       compare(kinds(), "list", "a mailbox becoming usable starts over on it")
+    }
+
+    // "Manage accounts..." on the switcher is an entry into Settings, from
+    // whichever root the switcher was opened over, and the page is entered at
+    // its top. The page keeps its scroll while it is in history — Back from a
+    // mailbox's form returns to the Mailboxes row it left — but a page that
+    // was left and entered again is a new visit, and a new visit that opened
+    // on the Calendars section because that is where the last one ended
+    // looked like the calendar had been opened instead of settings.
+    function test_manage_accounts_on_the_switcher_enters_settings_at_the_top() {
+      app.openSettings()
+      waitForRendering(app)
+      var page = named(app, "settings-page")
+      var view = page
+      while (view && String(view.toString()).indexOf("QQuickFlickable") < 0) view = view.parent
+      verify(view, "the settings page scrolls inside a Flickable")
+      var calendars = -1
+      for (var i = 0; i < page.sections.length; i++)
+        if (page.sections[i].key === "calendars") calendars = page.sections[i].y
+      verify(calendars > 0, "the Calendars section is some way down the page")
+      view.contentY = calendars
+      compare(view.contentY, calendars, "the previous visit ended on Calendars")
+      app.back()
+      compare(kinds(), "list")
+
+      // The switcher opens over the calendar root as readily as over the list.
+      app.showCalendar()
+      compare(kinds(), "calendar")
+      var switcher = having(app, function(it) {
+        return typeof it.openCentered === "function" && typeof it.manageRequested === "function"
+      })
+      switcher.openCentered()
+      tryCompare(switcher, "opened", true)
+      var manage = having(switcher.menuRows, function(it) {
+        return it.text === "Manage accounts..." && typeof it.activated === "function"
+      })
+      verify(manage && manage.visible, "the switcher offers Manage accounts...")
+      mouseClick(manage)
+      tryCompare(switcher, "opened", false)
+      compare(app.page, "settings", "which opens Settings")
+      compare(kinds(), "calendar,settings", "over the root it was opened on")
+      compare(app.calendarVisible, false, "and the calendar stands down for it")
+      verify(named(app, "settings-sidebar").visible, "the settings rail is up")
+      compare(view.contentY, 0, "at the top of the page, not where the last visit ended")
+      compare(named(app, "settings-sidebar").activeKey, page.sections[0].key)
+
+      // Back from a page pushed over Settings returns to where Settings was.
+      view.contentY = calendars
+      app.editAccount(0)
+      compare(kinds(), "calendar,settings,setup")
+      app.back()
+      compare(kinds(), "calendar,settings")
+      compare(view.contentY, calendars, "a return keeps the scroll")
     }
 
     function test_editing_an_account_from_settings_returns_to_settings() {

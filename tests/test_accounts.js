@@ -61,6 +61,8 @@ assert.strictEqual(accounts.accountId("  Ada@Example.COM "), "ada@example.com")
 assert.strictEqual(accounts.accountId("nobody"), "")
 assert.strictEqual(accounts.accountId(""), "")
 assert.strictEqual(accounts.accountId(null), "")
+assert.strictEqual(accounts.accountId("Ada@Hotmail.com", "outlook"),
+  "outlook:ada@hotmail.com")
 
 // ------------------------------------------------------------------ labels
 
@@ -472,6 +474,52 @@ assert.strictEqual(accounts.count(accounts.discardDraftAt(pendingList, 0)), 3)
   assert.strictEqual(accounts.count(list), 2)
   assert.strictEqual(accounts.find(list, "imap:jane@gmail.com").label, "Work")
 
+  // Saving Proton's address onto the iCloud row, when Proton already exists,
+  // used to rebuild the list with `add` and silently drop iCloud: the new id
+  // collided and replaced the Proton row, and the original slot was gone.
+  // `replaceAt` must refuse that collision so a re-auth cannot delete a
+  // mailbox that was not being edited.
+  let icloud = {
+    email: "ada@icloud.com", provider: "imap", label: "iCloud",
+    imap: { imapHost: "imap.mail.me.com", username: "ada" }
+  }
+  let proton = {
+    email: "ada@proton.me", provider: "imap", label: "Proton",
+    imap: { imapHost: "127.0.0.1", imapPort: 1143, smtpPort: 1025, insecure: true }
+  }
+  let mailboxes = accounts.emptyList()
+  mailboxes = accounts.add(mailboxes, icloud)
+  mailboxes = accounts.add(mailboxes, proton)
+  mailboxes = accounts.add(mailboxes, { email: "ada@gmail.com", provider: "imap", label: "Gmail" })
+  assert.strictEqual(accounts.collidingId(mailboxes, 0, proton), "imap:ada@proton.me")
+  const refused = accounts.replaceAt(mailboxes, 0, proton)
+  assert.strictEqual(accounts.count(refused), 3, "a colliding save must not drop a row")
+  assert.strictEqual(accounts.find(refused, "imap:ada@icloud.com").label, "iCloud")
+  assert.strictEqual(accounts.find(refused, "imap:ada@proton.me").label, "Proton")
+
+  // Filling a new draft with an address that is not already in the list is
+  // not a collision — that is Add account.
+  let adding = accounts.emptyList()
+  adding = accounts.add(adding, icloud)
+  adding = accounts.add(adding, { email: "ada@gmail.com", provider: "imap", label: "Gmail" })
+  adding = accounts.add(adding, { email: "", provider: "imap", pending: true })
+  assert.strictEqual(accounts.collidingId(adding, 2, proton), "")
+  const filled = accounts.replaceAt(adding, 2, proton)
+  assert.strictEqual(accounts.count(filled), 3)
+  assert.strictEqual(accounts.find(filled, "imap:ada@icloud.com").label, "iCloud")
+  assert.strictEqual(filled.accounts[2].id, "imap:ada@proton.me")
+
+  // A write that omits an id that was already persisted is the disk form of
+  // the same bug. Removal goes through `remove`, so save must refuse this.
+  const persisted = accounts.namedIds(mailboxes)
+  const withoutIcloud = accounts.savedOnly(accounts.remove(mailboxes, "imap:ada@icloud.com"))
+  assert.ok(accounts.dropsAnyId(persisted, withoutIcloud),
+    "a payload missing a persisted id is a drop")
+  assert.strictEqual(accounts.dropsAnyId(persisted, accounts.savedOnly(mailboxes)), false)
+  assert.strictEqual(accounts.withoutId(["a", "b", "c"], "b").join(","), "a,c",
+    "a corrected address releases the old id on purpose")
+  assert.strictEqual(accounts.withoutId(null, "b").length, 0)
+
   // Removing one leaves the other.
   list = accounts.remove(list, "imap:jane@gmail.com")
   assert.strictEqual(accounts.count(list), 1)
@@ -532,6 +580,97 @@ assert.strictEqual(accounts.count(accounts.discardDraftAt(pendingList, 0)), 3)
   assert.strictEqual(accounts.active(legacy).clientId, "abc")
 }
 
+// ------------------------------------------------------------ JMAP settings
+//
+// Four fields, and only one of them was typed. The rest are what sign-in
+// learned: the URL that finally answered, the scheme that was accepted, and
+// the account id the server's `primaryAccounts` named.
+
+{
+  const saved = accounts.serialize(accounts.add(accounts.emptyList(), {
+    email: "ada@example.org",
+    provider: "jmap",
+    jmap: {
+      sessionUrl: "https://mail.example.org/jmap/session",
+      username: "ada",
+      authScheme: "basic",
+      accountId: "t"
+    }
+  }))
+  const reloaded = accounts.find(accounts.load(saved), "jmap:ada@example.org")
+  assert.strictEqual(reloaded.provider, "jmap")
+  assert.strictEqual(reloaded.id, "jmap:ada@example.org",
+    "one address can be an IMAP mailbox and a JMAP one at the same time")
+  assert.strictEqual(reloaded.jmap.sessionUrl, "https://mail.example.org/jmap/session")
+  assert.strictEqual(reloaded.jmap.username, "ada")
+  assert.strictEqual(reloaded.jmap.authScheme, "basic")
+  assert.strictEqual(reloaded.jmap.accountId, "t")
+
+  // The secret is not here and never was: it goes to the keyring under
+  // `Credentials.jmapKeyringAttributes`, and accounts.json is world-readable.
+  assert.ok(saved.indexOf("secret") < 0)
+  assert.ok(saved.indexOf("password") < 0)
+
+  // Bearer is recorded when that is what answered.
+  assert.strictEqual(accounts.makeAccount({
+    email: "ada@fastmail.com", provider: "jmap", jmap: { authScheme: " Bearer " }
+  }).jmap.authScheme, "bearer")
+
+  // Anything else is Basic: an account that has not signed in yet has no
+  // scheme at all, and Basic is the one sign-in tries first. `none` is
+  // discovery's unauthenticated GET, which is not a way of signing in.
+  assert.strictEqual(accounts.makeAccount({ email: "ada@x.com", provider: "jmap" })
+    .jmap.authScheme, "basic")
+  assert.strictEqual(accounts.makeAccount({
+    email: "ada@x.com", provider: "jmap", jmap: { authScheme: "none" }
+  }).jmap.authScheme, "basic")
+  assert.strictEqual(accounts.makeAccount({
+    email: "ada@x.com", provider: "jmap", jmap: { authScheme: "digest" }
+  }).jmap.authScheme, "basic")
+
+  // A JMAP block is present on every account, so nothing has to guard an
+  // undefined one, and an account of another provider has an empty one.
+  const gmail = accounts.makeAccount({ email: "j@gmail.com", clientId: "abc" })
+  assert.strictEqual(gmail.jmap.sessionUrl, "")
+  assert.strictEqual(gmail.jmap.accountId, "")
+
+  // `jmap` is a provider a hand-edited or newer file may name, and it survives
+  // the round trip rather than reading as Gmail.
+  assert.strictEqual(accounts.makeAccount({ email: "j@x.com", provider: "JMAP" }).provider, "jmap")
+  assert.strictEqual(accounts.makeAccount({ email: "j@x.com", provider: " jmap " }).provider, "jmap")
+
+  // The same address over three providers is three mailboxes.
+  let list = accounts.emptyList()
+  list = accounts.add(list, { email: "ada@example.org", provider: "imap" })
+  list = accounts.add(list, { email: "ada@example.org", provider: "jmap" })
+  assert.strictEqual(accounts.count(list), 2)
+  assert.strictEqual(accounts.find(list, "jmap:ada@example.org").provider, "jmap")
+  assert.strictEqual(accounts.find(list, "imap:ada@example.org").provider, "imap")
+}
+
+// What sign-in learned, over what the page saved. The page can only write the
+// typed host and the username; the URL that answered, the scheme and the
+// account id exist only once the check has run, and an account that never
+// receives them can never be configured — which is the defect this covers.
+{
+  const typed = { sessionUrl: "mail.example.org", username: "jane", authScheme: "", accountId: "" }
+  const learned = accounts.jmapSettingsAfterSignIn(typed, {
+    sessionUrl: "https://mx.example.org/jmap/session", authScheme: "bearer",
+    accountId: "a1", canSend: true, mailboxCount: 5
+  })
+  deepEqual(learned, {
+    sessionUrl: "https://mx.example.org/jmap/session", username: "jane",
+    authScheme: "bearer", accountId: "a1"
+  }, "the three learned fields land and the typed username stays")
+  deepEqual(accounts.jmapSettingsAfterSignIn(learned, { sessionUrl: "", accountId: "" }),
+    learned, "a result short a field keeps the value already there")
+  deepEqual(accounts.jmapSettingsAfterSignIn(null, null),
+    { sessionUrl: "", username: "", authScheme: "basic", accountId: "" },
+    "nothing learned over nothing saved is the empty, Basic default")
+  deepEqual(accounts.jmapSettingsAfterSignIn(typed, { authScheme: "digest" }).authScheme,
+    "basic", "an unknown scheme is normalised the way the file's own is")
+}
+
 // ------------------------------------------------------------- signatures
 
 {
@@ -583,3 +722,137 @@ assert.strictEqual(accounts.count(accounts.discardDraftAt(pendingList, 0)), 3)
 }
 
 console.log("test_accounts.js ok")
+
+// ------------------------------------------------------------- the name
+
+// Two mailboxes can differ only in their domain and elide to the same handful
+// of characters in a list, so a name is the one thing that tells them apart.
+const named = accounts.setLabel(
+  accounts.add(accounts.emptyList(), { email: "me@gmail.com", provider: "gmail" }),
+  "me@gmail.com", "  Private  ")
+assert.strictEqual(named.accounts[0].label, "Private", "trimmed on the way in")
+assert.strictEqual(accounts.label(named.accounts[0]), "Private")
+
+// Empty is not a name and clears it, which puts the address back: `label`
+// falls through to the local part, so a mailbox is never left unnamed.
+const cleared = accounts.setLabel(named, "me@gmail.com", "   ")
+assert.strictEqual(cleared.accounts[0].label, "")
+assert.strictEqual(accounts.label(cleared.accounts[0]), "me")
+
+// Naming a mailbox that is not in the list changes nothing rather than adding
+// one, the way every other edit here behaves.
+assert.strictEqual(
+  accounts.serialize(accounts.setLabel(named, "nobody@example.org", "Ghost")),
+  accounts.serialize(named))
+
+// The rest of the entry survives, because the row is rebuilt rather than
+// patched and a field added later must not drop one added earlier.
+const withBoth = accounts.setSignature(named, "me@gmail.com", "Best, me")
+assert.strictEqual(withBoth.accounts[0].label, "Private")
+assert.strictEqual(withBoth.accounts[0].signature, "Best, me")
+assert.strictEqual(
+  accounts.setLabel(withBoth, "me@gmail.com", "Personal").accounts[0].signature,
+  "Best, me", "naming a mailbox does not forget its signature")
+
+// ---------------------------------------------------------------- replaceAt
+
+// Editing a row leaves the selection where it was. The rebuild passes through
+// `add`, whose rule for a list with no active row yet is "the first named row
+// is the one on screen" — right while a list is being built, and wrong while
+// one is being copied with its active row further down. Editing the second
+// mailbox used to hand the selection to the first, and the sign-in after the
+// save with it.
+const trio = accounts.add(accounts.add(accounts.add(accounts.emptyList(),
+  account("ada@example.com")),
+  account("bob@example.com", { provider: "imap" })),
+  account("cid@example.com", { provider: "jmap" }))
+const bobActive = accounts.setActive(trio, "imap:bob@example.com")
+const cidActive = accounts.setActive(trio, "jmap:cid@example.com")
+const beforeReplace = frozen(cidActive)
+
+const cidEdited = accounts.replaceAt(cidActive, 2,
+  Object.assign({}, cidActive.accounts[2], { jmap: { sessionUrl: "https://mail.example.com/jmap/session" } }))
+assert.strictEqual(frozen(cidActive), beforeReplace, "replaceAt leaves its input alone")
+assert.strictEqual(accounts.count(cidEdited), 3)
+assert.strictEqual(cidEdited.activeId, "jmap:cid@example.com",
+  "editing the active row keeps it active")
+assert.strictEqual(cidEdited.accounts[2].jmap.sessionUrl, "https://mail.example.com/jmap/session")
+assert.strictEqual(cidEdited.accounts[2].provider, "jmap", "and keeps the rest of the row")
+
+const adaEditedUnderCid = accounts.replaceAt(cidActive, 0,
+  Object.assign({}, cidActive.accounts[0], { label: "Work" }))
+assert.strictEqual(adaEditedUnderCid.activeId, "jmap:cid@example.com",
+  "editing another row does not move the selection to it")
+assert.strictEqual(adaEditedUnderCid.accounts[0].label, "Work")
+
+const bobEditedUnderCid = accounts.replaceAt(cidActive, 1,
+  Object.assign({}, cidActive.accounts[1], { label: "Home" }))
+assert.strictEqual(bobEditedUnderCid.activeId, "jmap:cid@example.com",
+  "nor to the first row, whichever row was edited")
+
+// The active row renamed follows its new id: the mailbox on screen is still
+// the one being edited, whatever it is now called.
+const bobRenamed = accounts.replaceAt(bobActive, 1,
+  Object.assign({}, bobActive.accounts[1], { email: "robert@example.com" }))
+assert.strictEqual(bobRenamed.accounts[1].id, "imap:robert@example.com")
+assert.strictEqual(bobRenamed.activeId, "imap:robert@example.com")
+
+// A row edited to name a mailbox already in the list is refused rather than
+// folded into it: `add` folding a re-added address is right for a list being
+// built, and wrong for an edit, where the fold deleted the other mailbox. The
+// list, and the selection, are left exactly as they were; the service says
+// why (`duplicateAccount`) from `collidingId`.
+const collision = Object.assign({}, cidActive.accounts[1], { email: "ada@example.com", provider: "gmail" })
+assert.strictEqual(accounts.collidingId(cidActive, 1, collision), "ada@example.com")
+const refusedEdit = accounts.replaceAt(cidActive, 1, collision)
+assert.strictEqual(accounts.count(refusedEdit), 3)
+assert.strictEqual(refusedEdit.accounts[0].id, "ada@example.com")
+assert.strictEqual(refusedEdit.accounts[1].id, "imap:bob@example.com")
+assert.strictEqual(refusedEdit.activeId, "jmap:cid@example.com")
+
+// A draft that gains its address while another row is active leaves that row
+// active: a mailbox being typed in is not the one on screen until the
+// service says so.
+const draftBeside = accounts.add(bobActive, { email: "", pending: true })
+assert.strictEqual(draftBeside.activeId, "imap:bob@example.com")
+const draftNamed = accounts.replaceAt(draftBeside, 3,
+  Object.assign({}, draftBeside.accounts[3], { email: "dee@example.com", provider: "imap" }))
+assert.strictEqual(draftNamed.accounts[3].id, "imap:dee@example.com")
+assert.strictEqual(draftNamed.activeId, "imap:bob@example.com")
+
+// With nothing active, the first named row takes the selection, which is the
+// rule a list being built already has.
+const nothingActive = accounts.replaceAt(
+  { version: accounts.VERSION, accounts: [{ id: "", email: "", provider: "gmail", pending: true }], activeId: "" },
+  0, { email: "eve@example.com" })
+assert.strictEqual(nothingActive.activeId, "eve@example.com")
+
+// Out of range is no edit.
+assert.strictEqual(frozen(accounts.replaceAt(cidActive, 3, account("x@example.com"))), beforeReplace)
+assert.strictEqual(frozen(accounts.replaceAt(cidActive, -1, account("x@example.com"))), beforeReplace)
+// Monitored labels ride with the mailbox and survive its other edits.
+{
+  const watched = accounts.toggleMonitored(named, "me@gmail.com", "Label_7")
+  deepEqual(watched.accounts[0].monitored, ["Label_7"])
+  deepEqual(accounts.toggleMonitored(watched, "me@gmail.com", "Label_7").accounts[0].monitored, [],
+    "toggling again stops watching")
+  const two = accounts.toggleMonitored(watched, "me@gmail.com", "Label_9")
+  deepEqual(two.accounts[0].monitored, ["Label_7", "Label_9"])
+  deepEqual(accounts.setLabel(two, "me@gmail.com", "Work").accounts[0].monitored, ["Label_7", "Label_9"],
+    "naming the mailbox keeps what it watches")
+  deepEqual(accounts.toggleMonitored(two, "nobody@example.org", "x").accounts[0].monitored, ["Label_7", "Label_9"])
+  deepEqual(accounts.toggleMonitored(two, "me@gmail.com", "  ").accounts[0].monitored, ["Label_7", "Label_9"])
+  deepEqual(accounts.load(accounts.serialize(two)).accounts[0].monitored, ["Label_7", "Label_9"],
+    "and it is written to disk and read back")
+}
+
+
+// An HTML signature sits beside the plain one and survives its edits.
+{
+  const rich = accounts.setSignatureHtml(named, "me@gmail.com", " <p>Ada</p> ")
+  assert.strictEqual(rich.accounts[0].signatureHtml, "<p>Ada</p>")
+  assert.strictEqual(accounts.setSignature(rich, "me@gmail.com", "Ada").accounts[0].signatureHtml, "<p>Ada</p>")
+  assert.strictEqual(accounts.setSignatureHtml(rich, "me@gmail.com", "").accounts[0].signatureHtml, "")
+  assert.strictEqual(accounts.load(accounts.serialize(rich)).accounts[0].signatureHtml, "<p>Ada</p>")
+}
+

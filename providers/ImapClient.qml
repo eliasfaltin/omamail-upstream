@@ -33,6 +33,21 @@ Item {
 
   readonly property string transport: auth ? auth.pluginDir + "/scripts/mail-transport.sh" : ""
 
+  readonly property bool oauthTransport: !!auth && String(auth.authMode || "") === "oauth2"
+
+  function addCredentialFields(fields, credential) {
+    if (oauthTransport) {
+      fields.push(Mail.encodeBase64(String(auth.settings.username || "")))
+      fields.push(Mail.encodeBase64(credential))
+    } else {
+      fields.push(Mail.encodeBase64(credential))
+    }
+  }
+
+  function transportMode(name) {
+    return String(name || "") + (oauthTransport ? "-oauth" : "")
+  }
+
   // What the server said its folders are, learned once per session with a
   // single LIST. Everything that names a folder goes through here: "\\Sent" is
   // "Sent Items" on Exchange and "[Gmail]/Sent Mail" on Gmail, and a client
@@ -41,6 +56,7 @@ Item {
   property var special: ({})
   property bool foldersLoaded: false
   property bool foldersLoading: false
+  property int foldersGeneration: 0
   property var folderWaiters: []
 
   signal sentCopyWarning(string warning)
@@ -125,14 +141,16 @@ Item {
       // a space or a backslash needs no escaping anywhere along the way — and
       // none of it reaches the process table.
       var fields = opening === ""
-        ? [Mail.encodeBase64(url), Mail.encodeBase64(credentials)]
-        : [Mail.encodeBase64(Imap.imapUrl(auth.settings, "")), Mail.encodeBase64(url),
-           Mail.encodeBase64(credentials), Mail.encodeBase64(opening)]
+        ? [Mail.encodeBase64(url)]
+        : [Mail.encodeBase64(Imap.imapUrl(auth.settings, "")), Mail.encodeBase64(url)]
+      root.addCredentialFields(fields, credentials)
+      if (opening !== "") fields.push(Mail.encodeBase64(opening))
       for (var j = 0; j < wanted.length; j++) fields.push(Mail.encodeBase64(wanted[j]))
 
       var process = transportComponent.createObject(root, {
         command: [root.transport],
-        requestLine: (opening === "" ? "imap " : "imap-id ") + fields.join(" ")
+        requestLine: root.transportMode(opening === "" ? "imap" : "imap-id")
+          + " " + fields.join(" ")
       })
       if (!process) {
         root.inFlight = Math.max(0, root.inFlight - 1)
@@ -187,31 +205,40 @@ Item {
     }
     if (foldersLoading) return
     foldersLoading = true
+    var generation = foldersGeneration
 
     // No folder in the URL: both of these are asked of the server rather than
     // of a mailbox, and they share the one connection.
-    function finish(error) {
+    function finish(text, error) {
       root.foldersLoading = false
-      if (!error) root.foldersLoaded = true
+      if (generation !== root.foldersGeneration) {
+        root.ensureFolders()
+        return
+      }
+      if (!error) {
+        // An empty LIST is authoritative when the last folder was deleted.
+        root.folders = Imap.parseList(text)
+        root.special = Imap.specialFolders(root.folders)
+        root.adoptServerAnswer(text)
+        root.foldersLoaded = true
+      }
       var waiting = root.folderWaiters.slice()
       root.folderWaiters = []
       for (var i = 0; i < waiting.length; i++) waiting[i](error)
     }
 
     run("", [Imap.capabilityCommand(), Imap.listCommand()], function(text, error) {
-      if (error) {
-        finish(error)
+      if (error || generation !== root.foldersGeneration) {
+        finish(text, error)
         return
       }
-      root.adoptServerAnswer(text)
+      var capabilities = Imap.parseCapabilities(text)
+      if (capabilities.length > 0) root.serverCapabilities = capabilities
       if (!Imap.hasCapability(root.serverCapabilities, "SPECIAL-USE")) {
-        finish("")
+        finish(text, "")
         return
       }
-      root.run("", [Imap.listCommand(true)], function(specialText, specialError) {
-        if (!specialError) root.adoptServerAnswer(specialText)
-        finish(specialError)
-      })
+      root.run("", [Imap.listCommand(true)], finish)
     })
   }
 
@@ -297,57 +324,54 @@ Item {
       // times, though, so an under-filled first range falls back to one snapshot
       // and one multi-command connection for everything older.
       if (typeof progress === "function" && criteria !== "") {
-        root.run(folder, [Imap.uidCeilingCommand()], function(ceilingText, ceilingError) {
+        var found = []
+        var emitted = {}
+        var nextUid = 0
+
+        function report(hasUnscanned) {
+          var partial = pageOf(found, hasUnscanned)
+          var ids = []
+          for (var i = 0; i < partial.ids.length; i++) {
+            if (emitted[partial.ids[i]]) continue
+            emitted[partial.ids[i]] = true
+            ids.push(partial.ids[i])
+          }
+          if (ids.length > 0) progress({
+            ids: ids,
+            threadIds: [],
+            nextPageToken: partial.nextPageToken,
+            estimate: partial.estimate
+          })
+          return partial
+        }
+
+        // `settled` says whether a first window has already answered: an
+        // error after one still leaves an authoritative prefix, an error
+        // before one says nothing about the cached preview.
+        function searchSnapshotRemainder(settled) {
           if (handle.aborted) return
-          if (ceilingError) {
-            finish([], ceilingError, false, false)
-            return
-          }
-          var ceiling = Imap.parseUidList(ceilingText)
-          var nextUid = ceiling.length > 0 ? ceiling[ceiling.length - 1] : 0
-          var found = []
-          var emitted = {}
-
-          function report(hasUnscanned) {
-            var partial = pageOf(found, hasUnscanned)
-            var ids = []
-            for (var i = 0; i < partial.ids.length; i++) {
-              if (emitted[partial.ids[i]]) continue
-              emitted[partial.ids[i]] = true
-              ids.push(partial.ids[i])
-            }
-            if (ids.length > 0) progress({
-              ids: ids,
-              threadIds: [],
-              nextPageToken: partial.nextPageToken,
-              estimate: partial.estimate
-            })
-            return partial
-          }
-
-          function searchSnapshotRemainder() {
+          root.run(folder, [Imap.uidListCommand()], function(snapshotText, snapshotError) {
             if (handle.aborted) return
-            root.run(folder, [Imap.uidListCommand()], function(snapshotText, snapshotError) {
+            if (snapshotError) {
+              finish(found, snapshotError, false, settled)
+              return
+            }
+            var snapshot = Imap.parseUidList(snapshotText)
+            var commands = Imap.searchCommands(criteria, snapshot, nextUid)
+            if (commands.length === 0) {
+              finish(found, "", false)
+              return
+            }
+            root.run(folder, commands, function(searchText, searchError) {
               if (handle.aborted) return
-              if (snapshotError) {
-                finish(found, snapshotError, false, true)
-                return
-              }
-              var snapshot = Imap.parseUidList(snapshotText)
-              var commands = Imap.searchCommands(criteria, snapshot, nextUid)
-              if (commands.length === 0) {
-                finish(found, "", false)
-                return
-              }
-              root.run(folder, commands, function(searchText, searchError) {
-                if (handle.aborted) return
-                if (!searchError) found = found.concat(Imap.parseSearch(searchText))
-                finish(found, searchError, false, true)
-              }, handle)
+              if (!searchError) found = found.concat(Imap.parseSearch(searchText))
+              finish(found, searchError, false, settled)
             }, handle)
-          }
+          }, handle)
+        }
 
-          var window = Imap.searchWindow(criteria, nextUid)
+        function searchBelow(ceiling) {
+          var window = Imap.searchWindow(criteria, ceiling)
           if (window.command === "") {
             finish(found, "", false)
             return
@@ -364,7 +388,45 @@ Item {
             if (partial.ids.length >= limit || nextUid === 0)
               finish(found, "", nextUid > 0)
             else
-              searchSnapshotRemainder()
+              searchSnapshotRemainder(true)
+          }, handle)
+        }
+
+        // The ceiling is the UID of the last message by sequence number,
+        // asked for in two short steps: the count from STATUS on an
+        // unselected connection, as the unread counts are, then one numeric
+        // FETCH. A FETCH that comes back empty — the last message expunged
+        // between the two — falls back to the complete snapshot rather than
+        // answering "nothing".
+        root.run("", [Imap.statusCommand(folder)], function(statusText, statusError) {
+          if (handle.aborted) return
+          if (statusError) {
+            finish([], statusError, false, false)
+            return
+          }
+          // A STATUS with no count is an odd server, not an empty mailbox:
+          // the complete snapshot answers instead of an authoritative nothing.
+          if (!/MESSAGES\s+\d+/i.test(String(statusText || ""))) {
+            searchSnapshotRemainder(false)
+            return
+          }
+          var count = Imap.parseStatus(statusText).messages
+          if (count < 1) {
+            finish([], "", false)
+            return
+          }
+          root.run(folder, [Imap.topUidCommand(count)], function(ceilingText, ceilingError) {
+            if (handle.aborted) return
+            // Some servers answer BAD to a range that starts past the end,
+            // which an expunge between STATUS and this FETCH can produce.
+            // The snapshot is the authoritative answer either way.
+            if (ceilingError) {
+              searchSnapshotRemainder(false)
+              return
+            }
+            var ceiling = Imap.parseUidList(ceilingText)
+            if (ceiling.length === 0) searchSnapshotRemainder(false)
+            else searchBelow(Math.max.apply(null, ceiling))
           }, handle)
         }, handle)
         return
@@ -389,6 +451,20 @@ Item {
           finish(Imap.parseSearch(searchText), searchError, false)
         }, handle)
       }, handle)
+    })
+    return handle
+  }
+
+  // The counted members of a conversation, for the reader's conversation rail.
+  //
+  // Always empty, and IMAP is never asked: it declares neither `threads` nor
+  // `conversations`. A row is a message and stands for nothing else, so there
+  // are no members to read.
+  function getSummaries(ids, callback) {
+    var handle = newHandle()
+    Qt.callLater(function() {
+      if (!root || handle.aborted || typeof callback !== "function") return
+      callback([], "")
     })
     return handle
   }
@@ -544,6 +620,9 @@ Item {
           id: folder.name,
           name: Imap.decodeMailbox(folder.name),
           rawName: folder.name,
+          // What the server separates a hierarchy with, so the sidebar can
+          // fold "Archive/2026" under "Archive" without guessing the slash.
+          delimiter: String(folder.delimiter || ""),
           // "system" means the mailbox row already offers it, so the sidebar
           // lists only the rest below. Judged on SPECIAL-USE rather than on the
           // structural flags every server sends on every folder.
@@ -691,8 +770,45 @@ Item {
     return handle
   }
 
+  // The folder list, changed. No mailbox is selected for these — the URL is
+  // the server alone — and the cached listing is dropped so the next read
+  // sees the server's answer rather than this client's memory of it.
+  function createLabel(name, callback) {
+    return changeFolders([Imap.createCommand(name)], callback)
+  }
+
+  function renameLabel(id, name, callback) {
+    return changeFolders([Imap.renameCommand(id, name)], callback)
+  }
+
+  function deleteLabel(id, callback) {
+    return changeFolders([Imap.deleteCommand(id)], callback)
+  }
+
+  function changeFolders(commands, callback) {
+    // Check the complete batch before credentials or a transport are requested.
+    for (var i = 0; i < commands.length; i++) {
+      if (commands[i] === "") {
+        if (typeof callback === "function") callback(null, "This folder name cannot be sent safely")
+        return newHandle()
+      }
+    }
+    return root.run("", commands, function(text, error) {
+      if (!error) {
+        root.foldersGeneration++
+        root.foldersLoaded = false
+      }
+      if (typeof callback === "function") callback(null, error)
+    })
+  }
+
+  // One id or a list of them, the way every other verb here already takes one.
+  // A row that stands for a conversation is trashed as its members, and the
+  // list arrives here flat — `applyPlan` groups by folder either way, so a
+  // batch is the same walk the single message already took.
   function trashMessage(id, callback) {
     var handle = newHandle()
+    var ids = Array.isArray(id) ? id : [id]
     ensureFolders(function(folderError) {
       if (handle.aborted) return
       if (folderError) {
@@ -705,25 +821,77 @@ Item {
           callback(null, "This server has no Trash folder to move the message to")
         return
       }
-      root.applyPlan([id], { add: [], remove: [], move: trash }, callback, handle)
+      root.applyPlan(ids, { add: [], remove: [], move: trash }, callback, handle)
     })
     return handle
   }
 
   function untrashMessage(id, callback) {
     var handle = newHandle()
+    var ids = Array.isArray(id) ? id : [id]
     ensureFolders(function(folderError) {
       if (handle.aborted) return
       if (folderError) {
         if (typeof callback === "function") callback(null, folderError)
         return
       }
-      root.applyPlan([id], { add: [], remove: ["\\Deleted"], move: "INBOX" }, callback, handle)
+      root.applyPlan(ids, { add: [], remove: ["\\Deleted"], move: "INBOX" }, callback, handle)
     })
     return handle
   }
 
   // ----------------------------------------------------------------- send
+
+  // One APPEND: the message goes up whole, so it is its own transport mode
+  // rather than a command in `run`. The flags travel with it, spelled in
+  // curl's dialect by `Imap.appendFlagWords`, because what a copy of each
+  // kind arrives under is the protocol's decision and not this one.
+  function appendMessage(folder, message, flagWords, failureLabel, callback,
+      existingHandle) {
+    var handle = existingHandle || newHandle()
+    root.inFlight++
+    auth.withCredentials(function(credentials, credentialError) {
+      if (!root) return
+      if (handle.aborted) {
+        root.inFlight = Math.max(0, root.inFlight - 1)
+        return
+      }
+      if (!credentials) {
+        root.inFlight = Math.max(0, root.inFlight - 1)
+        if (typeof callback === "function") callback(null, credentialError || "Not signed in")
+        return
+      }
+      var url = Imap.imapUrl(auth.settings, folder)
+      var fields = [Mail.encodeBase64(url)]
+      root.addCredentialFields(fields, credentials)
+      fields.push(Mail.encodeBase64(message), Mail.encodeBase64(flagWords))
+      var process = transportComponent.createObject(root, {
+        command: [root.transport],
+        requestLine: root.transportMode("imap-append") + " " + fields.join(" ")
+      })
+      if (!process) {
+        root.inFlight = Math.max(0, root.inFlight - 1)
+        if (typeof callback === "function") callback(null, "Could not start the mail transport")
+        return
+      }
+      handle.process = process
+      process.finished.connect(function(status, out, err) {
+        if (!root) return
+        if (handle.process === process) handle.process = null
+        process.destroy()
+        root.inFlight = Math.max(0, root.inFlight - 1)
+        if (handle.aborted || typeof callback !== "function") return
+        if (status !== 0) {
+          var detail = Imap.decodeResponse(err, Mail.base64ToBytes, Mail.bytesToLatin1)
+          callback(null, Imap.responseError(status, detail, failureLabel))
+          return
+        }
+        callback({}, "")
+      })
+      process.running = true
+    })
+    return handle
+  }
 
   function saveDraft(payload, callback) {
     var handle = newHandle()
@@ -746,60 +914,57 @@ Item {
         return
       }
 
-      root.inFlight++
-      auth.withCredentials(function(credentials, credentialError) {
-        if (!root) return
-        if (handle.aborted) {
-          root.inFlight = Math.max(0, root.inFlight - 1)
+      appendMessage(folder, Mail.decodeBase64Url(raw), Imap.appendFlagWords(false),
+        "The draft could not be saved", function(saved, appendError) {
+        if (!root || handle.aborted || typeof callback !== "function") return
+        if (appendError) {
+          callback(null, appendError)
           return
         }
-        if (!credentials) {
-          root.inFlight = Math.max(0, root.inFlight - 1)
-          if (typeof callback === "function") callback(null, credentialError || "Not signed in")
+        var sourceId = payload ? String(payload.draftId || "") : ""
+        if (sourceId === "") {
+          callback({}, "")
           return
         }
-        var url = Imap.imapUrl(auth.settings, folder)
-        var message = Mail.decodeBase64Url(raw)
-        var fields = [Mail.encodeBase64(url), Mail.encodeBase64(credentials),
-          Mail.encodeBase64("draft"), Mail.encodeBase64(message)]
-        var process = transportComponent.createObject(root, {
-          command: [root.transport],
-          requestLine: "imap-append " + fields.join(" ")
-        })
-        if (!process) {
-          root.inFlight = Math.max(0, root.inFlight - 1)
-          if (typeof callback === "function") callback(null, "Could not start the mail transport")
+        var replacement = Imap.draftReplacementPlan(sourceId, folder)
+        if (replacement.commands.length === 0) {
+          callback({ saved: true, warning: replacement.warning }, "")
           return
         }
-        handle.process = process
-        process.finished.connect(function(status, out, err) {
-          if (!root) return
-          if (handle.process === process) handle.process = null
-          process.destroy()
-          root.inFlight = Math.max(0, root.inFlight - 1)
+        root.run(folder, replacement.commands, function(text, replaceError) {
           if (handle.aborted || typeof callback !== "function") return
-          if (status !== 0) {
-            var detail = Imap.decodeResponse(err, Mail.base64ToBytes, Mail.bytesToLatin1)
-            callback(null, Imap.responseError(status, detail, "The draft could not be saved"))
-            return
-          }
-          var sourceId = payload ? String(payload.draftId || "") : ""
-          if (sourceId === "") {
-            callback({}, "")
-            return
-          }
-          var replacement = Imap.draftReplacementPlan(sourceId, folder)
-          if (replacement.commands.length === 0) {
-            callback({ saved: true, warning: replacement.warning }, "")
-            return
-          }
-          root.run(folder, replacement.commands, function(text, replaceError) {
-            if (handle.aborted || typeof callback !== "function") return
-            callback(Imap.draftSaveResult(replaceError), "")
-          }, handle)
-        })
-        process.running = true
-      })
+          callback(Imap.draftSaveResult(replaceError), "")
+        }, handle)
+      }, handle)
+    })
+    return handle
+  }
+
+  // The draft a sent message was opened from, taken away with the same
+  // commands a save uses to remove the copy it replaced.
+  function deleteDraft(messageId, callback) {
+    var handle = newHandle()
+    ensureFolders(function(folderError) {
+      if (handle.aborted) return
+      if (folderError) {
+        if (typeof callback === "function") callback(null, folderError)
+        return
+      }
+      var groups = Imap.groupByFolder([String(messageId || "")])
+      if (groups.length === 0) {
+        if (typeof callback === "function") callback(null, "")
+        return
+      }
+      var folder = groups[0].folder
+      var plan = Imap.draftReplacementPlan(String(messageId || ""), folder)
+      if (plan.commands.length === 0) {
+        if (typeof callback === "function") callback(null, plan.warning)
+        return
+      }
+      root.run(folder, plan.commands, function(text, error) {
+        if (handle.aborted) return
+        if (typeof callback === "function") callback(null, error)
+      }, handle)
     })
     return handle
   }
@@ -854,13 +1019,14 @@ Item {
       var sender = (fromAddresses.length > 0 && fromAddresses[0].email)
         ? fromAddresses[0].email
         : (settings ? String(settings.username || "") : "") || root.email
-      var fields = [Mail.encodeBase64(smtp), Mail.encodeBase64(credentials),
-        Mail.encodeBase64(sender), Mail.encodeBase64(message)]
+      var fields = [Mail.encodeBase64(smtp)]
+      root.addCredentialFields(fields, credentials)
+      fields.push(Mail.encodeBase64(sender), Mail.encodeBase64(message))
       for (var k = 0; k < recipients.length; k++) fields.push(Mail.encodeBase64(recipients[k]))
 
       var process = transportComponent.createObject(root, {
         command: [root.transport],
-        requestLine: "smtp " + fields.join(" ")
+        requestLine: root.transportMode("smtp") + " " + fields.join(" ")
       })
       if (!process) {
         root.inFlight = Math.max(0, root.inFlight - 1)
@@ -880,61 +1046,30 @@ Item {
           return
         }
         callback({}, "")
-        root.saveSentCopy(message, handle)
+        root.saveSentCopy(message)
       })
       process.running = true
     })
     return handle
   }
 
-  // SMTP acceptance cannot be undone. The UI finishes delivery at that point;
-  // filing a copy is a separate best-effort operation and may only warn.
-  function saveSentCopy(message, handle) {
+  // Delivery is complete before this independent, best-effort copy starts.
+  function saveSentCopy(message) {
     if (Imap.serverFilesSentCopy(auth ? auth.settings : null)) return
     ensureFolders(function(folderError) {
-      if (!root || (handle && handle.aborted)) return
+      if (!root) return
       if (folderError) {
         root.sentCopyWarning("Sent, but the Sent folder could not be found: " + folderError)
         return
       }
-      var sentFolder = root.special["\\sent"] || ""
-      if (sentFolder === "") {
+      var folder = Imap.sentFolder(root.special)
+      if (folder === "") {
         root.sentCopyWarning("Sent, but this server did not report a Sent folder")
         return
       }
-      auth.withCredentials(function(credentials, credentialError) {
-        if (!root || (handle && handle.aborted)) return
-        if (!credentials) {
-          root.sentCopyWarning("Sent, but the Sent copy could not be saved: "
-            + (credentialError || "Not signed in"))
-          return
-        }
-        var sentUrl = Imap.imapUrl(auth.settings, sentFolder)
-        var appendFields = [Mail.encodeBase64(sentUrl), Mail.encodeBase64(credentials),
-          Mail.encodeBase64("seen"), Mail.encodeBase64(message)]
-        root.inFlight++
-        var appendProcess = transportComponent.createObject(root, {
-          command: [root.transport],
-          requestLine: "imap-append " + appendFields.join(" ")
-        })
-        if (!appendProcess) {
-          root.inFlight = Math.max(0, root.inFlight - 1)
-          root.sentCopyWarning("Sent, but the Sent copy could not be saved")
-          return
-        }
-        if (handle) handle.process = appendProcess
-        appendProcess.finished.connect(function(appendStatus, appendOut, appendErr) {
-          if (!root) return
-          if (handle && handle.process === appendProcess) handle.process = null
-          appendProcess.destroy()
-          root.inFlight = Math.max(0, root.inFlight - 1)
-          if ((handle && handle.aborted) || appendStatus === 0) return
-          var appendDetail = Imap.decodeResponse(appendErr,
-            Mail.base64ToBytes, Mail.bytesToLatin1)
-          root.sentCopyWarning("Sent, but " + Imap.responseError(appendStatus,
-            appendDetail, "the Sent copy could not be saved"))
-        })
-        appendProcess.running = true
+      appendMessage(folder, message, Imap.appendFlagWords(true),
+        "the Sent copy could not be saved", function(filed, appendError) {
+        if (root && appendError) root.sentCopyWarning("Sent, but " + appendError)
       })
     })
   }
@@ -944,16 +1079,19 @@ Item {
   // password down and finding out later — leaves the user on a panel that says
   // it is signed in and never loads.
   function verifyCredentials(settings, credentials, callback) {
+    var owner = auth
+    var generation = oauthTransport ? owner.sessionGeneration : undefined
     var url = Imap.imapUrl(settings, "")
     if (url === "") {
       if (typeof callback === "function") callback(false, "This mailbox has no usable server address")
       return
     }
-    var fields = [Mail.encodeBase64(url), Mail.encodeBase64(credentials),
-      Mail.encodeBase64(Imap.capabilityCommand()), Mail.encodeBase64(Imap.listCommand())]
+    var fields = [Mail.encodeBase64(url)]
+    root.addCredentialFields(fields, credentials)
+    fields.push(Mail.encodeBase64(Imap.capabilityCommand()), Mail.encodeBase64(Imap.listCommand()))
     var process = transportComponent.createObject(root, {
       command: [root.transport],
-      requestLine: "imap " + fields.join(" ")
+      requestLine: root.transportMode("imap") + " " + fields.join(" ")
     })
     if (!process) {
       if (typeof callback === "function") callback(false, "Could not start the mail transport")
@@ -962,6 +1100,7 @@ Item {
     process.finished.connect(function(status, out, err) {
       if (!root) return
       process.destroy()
+      if (root.auth !== owner || (root.oauthTransport && owner.sessionGeneration !== generation)) return
       if (typeof callback !== "function") return
       var text = Imap.decodeResponse(out, Mail.base64ToBytes, Mail.bytesToLatin1)
       var detail = Imap.decodeResponse(err, Mail.base64ToBytes, Mail.bytesToLatin1)
@@ -978,7 +1117,6 @@ Item {
       // asking again.
       root.adoptServerAnswer(text)
       root.foldersLoaded = root.folders.length > 0
-        && !Imap.hasCapability(root.serverCapabilities, "SPECIAL-USE")
       callback(true, "")
     })
     process.running = true
@@ -987,8 +1125,10 @@ Item {
   Connections {
     target: root.auth
     function onVerifyRequested(settings, credentials) {
+      var owner = root.auth
+      var generation = root.oauthTransport ? owner.sessionGeneration : undefined
       root.verifyCredentials(settings, credentials, function(ok, error) {
-        if (root.auth) root.auth.completeSignIn(ok, error)
+        if (root.auth === owner) owner.completeSignIn(ok, error, generation)
       })
     }
     // A mailbox whose server settings changed is a different mailbox: the

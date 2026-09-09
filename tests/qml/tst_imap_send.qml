@@ -111,8 +111,8 @@ Item {
       verify(append, "SMTP success must append a Sent copy")
       var fields = String(append.requestLine).split(" ")
       compare(Mail.decodeBase64Url(fields[1]), "imaps://imap.example.org:993/Sent%20Items")
-      compare(Mail.decodeBase64Url(fields[3]), "seen")
-      compare(Mail.decodeBase64Url(fields[4]), sentMessage,
+      compare(Mail.decodeBase64Url(fields[4]), "seen")
+      compare(Mail.decodeBase64Url(fields[3]), sentMessage,
         "the saved copy must be the exact message accepted by SMTP")
 
       append.finished(0, "", "")

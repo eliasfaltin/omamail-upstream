@@ -1,7 +1,10 @@
 import QtQuick
+import Quickshell.Io
 import qs.Commons
 import qs.Ui
 import "../message/Direction.js" as Direction
+import "../message/Signature.js" as Signature
+import "../message/Html.js" as Html
 
 // Where mailboxes are managed.
 //
@@ -62,6 +65,112 @@ Column {
     return out
   }
 
+  property string selectedNameAccountId: ""
+
+  function nameOptions() {
+    var out = []
+    for (var i = 0; i < signatureAccounts.length; i++)
+      out.push({ value: signatureAccounts[i].id, label: signatureAccounts[i].email })
+    return out
+  }
+
+  function saveName() {
+    if (service && selectedNameAccountId !== "")
+      service.setAccountLabel(selectedNameAccountId, nameEdit.text)
+  }
+
+  function selectNameAccount(id) {
+    var next = signatureAccount(id)
+    if (!next || String(next.id || "") === selectedNameAccountId) return
+    saveName()
+    selectedNameAccountId = String(next.id || "")
+    nameEdit.text = String(next.label || "")
+  }
+
+  function ensureNameAccount() {
+    if (signatureAccounts.length === 0) {
+      selectedNameAccountId = ""
+      nameEdit.text = ""
+      return
+    }
+    if (signatureAccount(selectedNameAccountId)) return
+    var activeId = service ? String(service.activeAccountId || "") : ""
+    var next = signatureAccount(activeId) || signatureAccounts[0]
+    selectedNameAccountId = String(next.id || "")
+    nameEdit.text = String(next.label || "")
+  }
+
+  // The imported markup for the selected mailbox, and the import in flight.
+  readonly property string selectedSignatureHtml: {
+    var entry = signatureAccount(selectedSignatureAccountId)
+    return entry ? String(entry.signatureHtml || "") : ""
+  }
+  property bool importing: false
+  property string importNote: ""
+  property bool importFailed: false
+  property string importStage: ""
+
+  function importSignature() {
+    if (importing || !service) return
+    importing = true
+    importNote = ""
+    importFailed = false
+    importStage = "pick"
+    signatureImporter.command = [root.attachScript, "pick"]
+    signatureImporter.running = true
+  }
+
+  function finishImport(text) {
+    var result = null
+    try { result = JSON.parse(String(text || "")) } catch (e) { result = null }
+    if (!result || result.ok !== true) {
+      var reason = result && result.error ? String(result.error) : ""
+      importing = false
+      if (reason !== "" && reason !== "cancelled") { importNote = reason; importFailed = true }
+      return
+    }
+    if (importStage === "pick") {
+      var paths = Array.isArray(result.paths) ? result.paths : []
+      if (paths.length === 0) { importing = false; return }
+      importStage = "read"
+      signatureImporter.command = [root.attachScript, "read", String(paths[0])]
+      signatureImporter.running = true
+      return
+    }
+    importing = false
+    var mime = String(result.mimeType || "").toLowerCase()
+    var name = String(result.filename || "").toLowerCase()
+    var imported
+    if (mime.indexOf("image/") === 0) {
+      imported = Signature.importImage(String(result.data || ""))
+    } else if (mime === "text/html" || mime === "application/xhtml+xml" || /\.x?html?$/.test(name)) {
+      imported = Signature.importHtml(Qt.atob(String(result.data || "")))
+    } else {
+      imported = { problem: "Choose a PNG, JPEG, GIF or WebP picture, or an HTML file" }
+    }
+    importNote = Signature.importNote(imported)
+    importFailed = String(imported.problem || "") !== ""
+    if (importFailed) return
+    service.setAccountSignatureHtml(selectedSignatureAccountId, imported.html)
+    // The words for a text-only client, unless the editor already has some.
+    if (String(imported.plain || "") !== "" && String(signatureEdit.text || "").trim() === "") {
+      signatureEdit.text = imported.plain
+      saveSignature()
+    }
+  }
+
+  readonly property string attachScript: {
+    var url = String(Qt.resolvedUrl("../scripts/attachment.sh"))
+    return decodeURIComponent(url.replace(/^file:\/\//, ""))
+  }
+
+  Process {
+    id: signatureImporter
+    stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: root.finishImport(String(stdout.text || ""))
+  }
+
   function saveSignature() {
     if (service && selectedSignatureAccountId !== "")
       service.setAccountSignature(selectedSignatureAccountId, signatureEdit.text)
@@ -88,8 +197,14 @@ Column {
     signatureEdit.text = String(next.signature || "")
   }
 
-  onSignatureAccountsChanged: ensureSignatureAccount()
-  Component.onCompleted: ensureSignatureAccount()
+  onSignatureAccountsChanged: {
+    ensureSignatureAccount()
+    ensureNameAccount()
+  }
+  Component.onCompleted: {
+    ensureSignatureAccount()
+    ensureNameAccount()
+  }
 
   spacing: Style.space(16)
 
@@ -235,6 +350,120 @@ Column {
       foreground: root.textColor
       accent: root.accentColor
       onToggled: if (root.service) root.service.setAlwaysShowImages(!root.service.alwaysShowImages)
+    }
+  }
+
+  // Showing a message as the cursor reaches it, and the dwell that keeps that
+  // from reading a mailbox by holding an arrow key down.
+  Rectangle {
+    width: parent.width
+    implicitHeight: Math.max(previewText.implicitHeight, previewSwitch.implicitHeight)
+      + Style.space(16)
+    radius: Style.cornerRadius
+    color: Style.normalFillFor(root.textColor, root.accentColor)
+
+    Column {
+      id: previewText
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(12)
+      anchors.right: previewSwitch.left
+      anchors.rightMargin: Style.space(10)
+      anchors.verticalCenter: parent.verticalCenter
+      spacing: Style.space(2)
+
+      Text {
+        width: parent.width
+        text: "Preview as the cursor moves"
+        color: root.textColor
+        font.family: root.panelFontFamily
+        font.pixelSize: Style.font.bodySmall
+        textFormat: Text.PlainText
+      }
+
+      Text {
+        width: parent.width
+        text: "Show a message as soon as j, k or an arrow reaches it, instead of "
+          + "waiting for Enter. A previewed message is marked read only once the "
+          + "cursor has stayed on it, so stepping through a list does not read it. "
+          + "Not applied in a narrow window, where the reader takes the list's place."
+        color: root.dimColor
+        font.family: root.panelFontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+        textFormat: Text.PlainText
+      }
+    }
+
+    ToggleSwitch {
+      id: previewSwitch
+      objectName: "previewOnCursorSwitch"
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(10)
+      anchors.verticalCenter: parent.verticalCenter
+      checked: !!root.service && root.service.previewOnCursor
+      foreground: root.textColor
+      accent: root.accentColor
+      onToggled: if (root.service)
+        root.service.setPreviewOnCursor(!root.service.previewOnCursor)
+    }
+  }
+
+  Rectangle {
+    width: parent.width
+    visible: !!root.service && root.service.previewOnCursor
+    implicitHeight: Math.max(dwellText.implicitHeight, dwellSeconds.implicitHeight)
+      + Style.space(16)
+    radius: Style.cornerRadius
+    color: Style.normalFillFor(root.textColor, root.accentColor)
+
+    Column {
+      id: dwellText
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(12)
+      anchors.right: dwellSeconds.left
+      anchors.rightMargin: Style.space(16)
+      anchors.verticalCenter: parent.verticalCenter
+      spacing: Style.space(2)
+
+      Text {
+        width: parent.width
+        text: "Mark a previewed message read after"
+        color: root.textColor
+        font.family: root.panelFontFamily
+        font.pixelSize: Style.font.bodySmall
+        textFormat: Text.PlainText
+      }
+
+      Text {
+        width: parent.width
+        text: "How long the cursor has to stay before it counts as read. "
+          + "Set 0 to mark it read as soon as it is previewed. Enter always does."
+        color: root.dimColor
+        font.family: root.panelFontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+        textFormat: Text.PlainText
+      }
+    }
+
+    NumberField {
+      id: dwellSeconds
+      objectName: "markReadDelayField"
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(12)
+      anchors.verticalCenter: parent.verticalCenter
+      label: "Seconds"
+      from: 0
+      to: 30
+      stepSize: 1
+      value: root.service ? root.service.markReadDelaySec : 2
+      foreground: root.textColor
+      accent: root.accentColor
+      fontFamily: root.panelFontFamily
+      fontSize: Style.font.bodySmall
+      onModified: function(next) {
+        if (root.service) root.service.setMarkReadDelaySec(next)
+      }
     }
   }
 
@@ -556,6 +785,82 @@ Column {
       }
     }
 
+    // A signature from a file: a picture, or markup another tool wrote. What
+    // is imported is rebuilt by Signature.js — scripts, styles, handlers,
+    // frames, forms, remote images and unknown attributes do not survive —
+    // and the preview draws what was stored, so it is the sent thing that is
+    // shown. The words go into the plain editor above for text-only clients.
+    Row {
+      width: parent.width
+      spacing: Style.space(8)
+
+      Button {
+        objectName: "settings-signature-import"
+        text: root.importing ? "Importing" : "Import from file..."
+        tooltipText: "A PNG, JPEG, GIF or WebP picture, or an HTML file"
+        foreground: root.textColor
+        bordered: true
+        accent: root.accentColor
+        fontFamily: root.panelFontFamily
+        fontSize: Style.font.caption
+        enabled: !root.importing && root.selectedSignatureAccountId !== ""
+        onClicked: root.importSignature()
+      }
+
+      Button {
+        objectName: "settings-signature-remove-html"
+        visible: root.selectedSignatureHtml !== ""
+        text: "Remove imported markup"
+        foreground: root.dimColor
+        bordered: false
+        fontFamily: root.panelFontFamily
+        fontSize: Style.font.caption
+        onClicked: {
+          if (root.service) root.service.setAccountSignatureHtml(root.selectedSignatureAccountId, "")
+          root.importNote = ""
+        }
+      }
+    }
+
+    Text {
+      width: parent.width
+      visible: root.importNote !== ""
+      textFormat: Text.PlainText
+      text: root.importNote
+      color: root.importFailed ? root.urgentColor : root.dimColor
+      font.family: root.panelFontFamily
+      font.pixelSize: Style.font.caption
+      wrapMode: Text.WordWrap
+    }
+
+    Rectangle {
+      objectName: "settings-signature-preview"
+      width: parent.width
+      visible: root.selectedSignatureHtml !== ""
+      implicitHeight: Math.min(Style.space(220), signaturePreview.implicitHeight + Style.space(20))
+      radius: Style.cornerRadius
+      color: Style.normalFillFor(root.textColor, root.accentColor)
+      clip: true
+
+      TextEdit {
+        id: signaturePreview
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: parent.top
+        anchors.margins: Style.space(10)
+        readOnly: true
+        selectByMouse: false
+        wrapMode: TextEdit.Wrap
+        textFormat: TextEdit.RichText
+        color: root.textColor
+        font.family: root.panelFontFamily
+        font.pixelSize: Style.font.bodySmall
+        // The stored markup, and nothing else: the same string that is sent.
+        text: Html.documentFor(root.selectedSignatureHtml, {
+          foreground: root.textColor, background: "transparent", link: root.accentColor })
+      }
+    }
+
     Text {
       width: parent.width
       text: "Sits under a new message, and above the quoted text in a reply. "
@@ -580,6 +885,94 @@ Column {
     font.letterSpacing: 1
   }
 
+  // What to call a mailbox, which the list below draws and the switcher and
+  // every merged row draw too. Two of these can differ only in their domain
+  // and elide to the same handful of characters, so a name is the one thing
+  // that tells them apart at a glance.
+  //
+  // A picker and one field rather than a field on each row: the rows carry
+  // live mailbox state and are rebuilt whenever a poll changes an unread
+  // count, which would take the field apart while it was being typed into.
+  // This is the same reason the signature editor is shaped this way.
+  Column {
+    width: parent.width
+    spacing: Style.space(6)
+    visible: root.signatureAccounts.length > 0
+
+    // Two questions, one under the other, each with its own label: which
+    // mailbox, and what to call it. They were one block under a single "Name"
+    // heading, which read as though the address in the picker *was* the name
+    // and left nothing that looked like somewhere to type.
+    Text {
+      width: parent.width
+      visible: root.signatureAccounts.length > 1
+      text: "Mailbox"
+      color: root.textColor
+      font.family: root.panelFontFamily
+      font.pixelSize: Style.font.bodySmall
+    }
+
+    Dropdown {
+      objectName: "settings-name-account-picker"
+      visible: root.signatureAccounts.length > 1
+      width: parent.width
+      showLabel: false
+      value: root.selectedNameAccountId
+      options: root.nameOptions()
+      foreground: root.textColor
+      accent: root.accentColor
+      fontFamily: root.panelFontFamily
+      onChanged: function(next) { root.selectNameAccount(next) }
+    }
+
+    Item {
+      width: parent.width
+      implicitHeight: Style.space(4)
+      visible: root.signatureAccounts.length > 1
+    }
+
+    Text {
+      width: parent.width
+      text: "Name"
+      color: root.textColor
+      font.family: root.panelFontFamily
+      font.pixelSize: Style.font.bodySmall
+    }
+
+    // The kit's own single-line input, which is what every other field on
+    // this page is: it carries the focus ring, the selection colours and a
+    // real placeholder, and it takes a click without one being arranged for
+    // it. A hand-built Rectangle around a bare TextInput drew the same box
+    // and could not be typed into.
+    TextField {
+      id: nameEdit
+      objectName: "settings-name-editor"
+      width: parent.width
+      foreground: root.textColor
+      accent: root.accentColor
+      font.family: root.panelFontFamily
+      font.pixelSize: Style.font.bodySmall
+
+      // Saved on the way out rather than on every keystroke, so the account
+      // file is written once per edit and the field is never rebuilt from
+      // under the cursor.
+      onActiveFocusChanged: if (!activeFocus) root.saveName()
+      onAccepted: root.saveName()
+    }
+
+    Text {
+      width: parent.width
+      textFormat: Text.PlainText
+      text: "What this mailbox is called in Omamail — in the switcher, in this "
+        + "list, and beside every message in a combined view. Leave it empty "
+        + "to use the address. It is not sent to anyone."
+      color: root.dimColor
+      font.family: root.panelFontFamily
+      font.pixelSize: Style.font.caption
+      wrapMode: Text.WordWrap
+    }
+  }
+
   Column {
     width: parent.width
     spacing: Style.space(2)
@@ -596,9 +989,12 @@ Column {
         implicitHeight: Math.max(rowText.implicitHeight, rowActions.implicitHeight)
           + Style.space(16)
         radius: Style.cornerRadius
-        color: modelData.active
-          ? Style.selectedFillFor(root.textColor, root.accentColor)
-          : Style.normalFillFor(root.textColor, root.accentColor)
+        // Which mailbox the window is showing is not a fact about this page.
+        // Nothing here acts on it — `Edit...` acts on its own row, and the
+        // signature section names the mailbox it signs — and the row answers
+        // no click, so marking it borrowed the switcher's "you are here, click
+        // another" fill for a row that switches nothing.
+        color: Style.normalFillFor(root.textColor, root.accentColor)
 
         Column {
           id: rowText
@@ -612,16 +1008,26 @@ Column {
           Text {
             width: parent.width
             textFormat: Text.PlainText
-            text: row.modelData.email !== "" ? row.modelData.email : "New mailbox"
+            // The name if one was given, so this list and the switcher agree
+            // about what each mailbox is called. The address is on the line
+            // below either way, which keeps the row identifiable.
+            text: {
+              var named = row.modelData.name !== undefined
+                && String(row.modelData.name) !== ""
+              if (named) return String(row.modelData.name)
+              return row.modelData.email !== "" ? row.modelData.email : "New mailbox"
+            }
             color: root.textColor
             font.family: root.panelFontFamily
             font.pixelSize: Style.font.bodySmall
-            font.bold: row.modelData.active
             elide: Text.ElideMiddle
           }
 
           Text {
             width: parent.width
+            // The address and whatever a server had to say are both in here,
+            // and Qt's default would run the rich text engine over either.
+            textFormat: Text.PlainText
             text: {
               if (row.modelData.error !== undefined && row.modelData.error !== "")
                 return row.modelData.error
@@ -629,10 +1035,29 @@ Column {
               var count = row.modelData.unread
               var unread = count === 0 ? "No unread mail"
                 : (count === 1 ? "1 unread message" : count + " unread messages")
-              return row.modelData.active ? unread + " · showing now" : unread
+              // A named row has put its name on the line above, so the address
+              // belongs here — otherwise nothing on the row says which mailbox
+              // it is.
+              var named = row.modelData.name !== undefined
+                && String(row.modelData.name) !== ""
+              return named ? String(row.modelData.email) + " · " + unread : unread
             }
             color: row.modelData.error !== undefined && row.modelData.error !== ""
               ? root.urgentColor : root.dimColor
+            font.family: root.panelFontFamily
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
+          }
+
+          // What kind of mailbox this is, where the kind is not obvious from
+          // the address. Only the providers with something to add answer here,
+          // so the row gains a line rather than every row gaining a blank one.
+          Text {
+            width: parent.width
+            visible: text !== ""
+            textFormat: Text.PlainText
+            text: row.modelData.detail !== undefined ? row.modelData.detail : ""
+            color: root.dimColor
             font.family: root.panelFontFamily
             font.pixelSize: Style.font.caption
             elide: Text.ElideRight

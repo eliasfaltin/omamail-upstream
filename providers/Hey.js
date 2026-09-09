@@ -48,6 +48,11 @@ var CAPABILITIES = {
   move: false,
   // A topic id, which is HEY's own conversation.
   threads: true,
+  // And the listing is already made of them: `hey threads` answers one entry
+  // per topic, so a HEY row has always stood for a conversation rather than
+  // for a message. Nothing above the seam has to group anything here; it only
+  // has to know that a row means what this says it means.
+  conversations: true,
   // Deliberately off. HEY has no archive: a thread is moved to another box, or
   // set aside, or left where it is, and none of those is what the key means.
   // Spending "e" on a move to Paper Trail would file mail somewhere the user
@@ -119,6 +124,14 @@ function cachedSummaryInSearch(sourceQuery, summary) {
 // Selecting a label in the sidebar. HEY addresses a label by id, not by name —
 // `hey label <id>` takes nothing else — so the id is what the sidebar carries
 // as a label's `rawName` and what arrives here.
+// HEY's search takes words, not operators, so an address is searched as a
+// word: from and to cannot be told apart, and that is said by answering the
+// same query for both rather than by pretending.
+function addressQuery(field, address) {
+  var value = String(address === undefined || address === null ? "" : address).trim()
+  return value === "" ? "" : "search:" + value
+}
+
 function labelQuery(name) {
   var value = String(name === undefined || name === null ? "" : name).trim()
   return value === "" ? "" : "label:" + value
