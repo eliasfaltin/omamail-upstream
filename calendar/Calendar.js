@@ -72,13 +72,41 @@ function decodeXml(value) {
     .replace(/&amp;/g, "&")
 }
 
+// An element's text, with both of the encodings a server is allowed to use.
+// RFC 4791 section 9.6 lets a calendar object arrive entity-escaped or inside a
+// CDATA section, and servers send the second: DAViCal wraps every object, and
+// this reached the project from an iCloud account whose calendars read empty.
+// Unwrapped, the payload begins `<![CDATA[BEGIN:VCALENDAR`, which is not a
+// property line, so the parse finds no VCALENDAR root and there are no events.
+//
+// The two encodings cannot be undone in one pass. A CDATA section's content is
+// already literal — `&amp;` inside one is those five characters, and a summary
+// of "Q&amp;A" would come out "Q&A" if the entity pass ran over it. So the
+// markers are cut and the entity pass runs only on the text between sections,
+// which is where the entities an escaping server wrote actually are.
+function decodeXmlText(value) {
+  var text = String(value || "")
+  var out = ""
+  var index = 0
+  while (true) {
+    // Case-sensitive: `<![cdata[` is ordinary text in XML, not a section.
+    var start = text.indexOf("<![CDATA[", index)
+    if (start < 0) break
+    var end = text.indexOf("]]>", start + 9)
+    if (end < 0) break
+    out += decodeXml(text.substring(index, start)) + text.substring(start + 9, end)
+    index = end + 3
+  }
+  return out + decodeXml(text.substring(index))
+}
+
 function tagText(block, localName) {
   var name = String(localName || "").replace(/[^A-Za-z0-9_-]/g, "")
   if (name === "") return ""
   var pattern = new RegExp("<(?:[A-Za-z0-9_-]+:)?" + name
     + "(?:\\s[^>]*)?>([\\s\\S]*?)</(?:[A-Za-z0-9_-]+:)?" + name + ">", "i")
   var match = pattern.exec(String(block || ""))
-  return match ? decodeXml(match[1]) : ""
+  return match ? decodeXmlText(match[1]) : ""
 }
 
 function caldavResponses(xml) {
@@ -498,34 +526,6 @@ function createEvent(fields, nowMs) {
     google: googleEventBody(checked)
   }
   if (recurrence.rule !== "") result.google.recurrence = ["RRULE:" + recurrence.rule]
-  return result
-}
-
-// Turn an accepted mail invitation into a calendar event. Its UID is kept so
-// a repeated CalDAV PUT updates the same resource instead of making a copy.
-function importInvitation(invite, nowMs) {
-  var event = invite || {}
-  if (!event.start || !event.end)
-    return { ok: false, error: "The invitation has no complete event time" }
-  var checked = validateEventFields({
-    title: event.summary,
-    startMs: event.start.ms,
-    endMs: event.end.ms,
-    description: event.description,
-    location: event.location
-  })
-  if (!checked.ok) return checked
-  var uid = String(event.uid || "").trim()
-  if (uid === "") return { ok: false, error: "The invitation has no identity" }
-  var rule = String(event.recurrenceRule || "").replace(/\r\n|\n|\r/g, "")
-  var sequence = Math.max(0, Math.floor(Number(event.sequence) || 0))
-  var stampMs = Number(nowMs) || Date.now()
-  var allDay = event.start.allDay === true && event.end.allDay === true
-  var result = {
-    ok: true,
-    uid: uid,
-    ics: veventLines(icsText(uid), sequence, stampMs, checked, rule, allDay).join("\r\n")
-  }
   return result
 }
 

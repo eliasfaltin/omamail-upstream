@@ -1,5 +1,7 @@
 .pragma library
 
+.import "Direction.js" as Direction
+
 // Message HTML, reduced to what Qt's rich text engine may safely be handed.
 //
 // This is not a renderer. Qt already is one: a QTextDocument behind the
@@ -108,6 +110,20 @@ function readTag(text, from, out) {
   // still hand back a copy. Cheaper to have noticed while reading it.
   var name = text.substring(nameStart, at)
   if (upper) name = name.toLowerCase()
+
+  // Closing tags carry no attributes. Nearly every one ends here, so do not
+  // allocate an empty list or enter the start-tag attribute scanner for the
+  // common half of a document's tags. Odd malformed closings still take the
+  // tolerant path below and keep its existing behaviour.
+  if (closing) {
+    var closeAt = at
+    while (closeAt < length && isSpaceCode(text.charCodeAt(closeAt))) closeAt++
+    if (text.charCodeAt(closeAt) === 62) {
+      out.end = closeAt + 1
+      out.terminated = true
+      return { type: "end", name: name }
+    }
+  }
 
   var attributes = []
   var selfClosing = false
@@ -328,8 +344,10 @@ function parse(html) {
     var top = stack[stack.length - 1]
 
     if (token.type === "text") {
-      if (token.text !== "")
-        top.children.push({ type: "text", text: token.text, raw: token.raw === true })
+      // This token already is the tree node's exact shape and is never reused
+      // by the streaming tokenizer. Keep it instead of allocating and copying
+      // every text run in the message.
+      if (token.text !== "") top.children.push(token)
       return
     }
     // A comment or a doctype has nothing a reader needs, and Qt would lay the
@@ -620,9 +638,9 @@ var PUBLIC_TLD = /\.(xn--[a-z0-9-]+|[a-z]{2,})$/
 // ".internal", every IPv6 literal, and an address written in octal, in hex, or
 // as one number — without having to have thought of each of them first.
 //
-// A public name that resolves to a private address is beyond what any check on
-// the URL can see. That is DNS rebinding, and stopping it needs a resolver
-// this plugin does not own.
+// This is a name check only. scripts/public_http.py checks every DNS answer
+// and pins the connection to a checked IP before fetching a remote image or
+// posting an unsubscribe; a second hostname lookup would reopen rebinding.
 function isPublicHost(host) {
   var name = String(host || "")
   if (name === "" || name.length > 253) return false
@@ -731,6 +749,20 @@ function splitDeclarations(style) {
     })
   }
   return declarations
+}
+
+// Reader mode, image discovery and the formatted cleaner all inspect the
+// sender's original style before `clean` rewrites it. Keep that one parse on
+// the source node so style-heavy mail does not rescan the same string in every
+// walk. The cache is deliberately source-only: fitting later reads the cleaned
+// style from attrs and calls splitDeclarations directly.
+function sourceDeclarations(node) {
+  if (node._sourceDeclarationsRead === true) return node._sourceDeclarations
+  var style = attributeOf(node, "style")
+  node._sourceDeclarationsRead = true
+  node._sourceDeclarations = style !== null && style.value !== null
+    && style.value !== undefined ? splitDeclarations(style.value) : null
+  return node._sourceDeclarations
 }
 
 function joinDeclarations(declarations) {
@@ -849,7 +881,7 @@ function isTrackingPixel(node) {
   var height = Number(attributeValue(node, "height"))
   if (isFinite(width) && attributeValue(node, "width") !== "" && width <= 2) return true
   if (isFinite(height) && attributeValue(node, "height") !== "" && height <= 2) return true
-  var declarations = splitDeclarations(attributeValue(node, "style"))
+  var declarations = sourceDeclarations(node) || []
   for (var i = 0; i < declarations.length; i++) {
     if (declarations[i].name !== "width" && declarations[i].name !== "height") continue
     if (/^[012](\.\d+)?px/i.test(declarations[i].value)) return true
@@ -963,39 +995,6 @@ var MAX_TABLE_DEPTH = 4
 // every element in the document, which on a large message is most of the work.
 var HANDLER_ATTRIBUTE = /^on[a-z]+$/
 
-// The addresses a caller may prepare before Qt receives the document. Taken
-// from the parsed tree so asking for them costs no second parse, with the same
-// tracker, host and count rules the renderer uses.
-function readerRemoteImageSources(root, limit) {
-  var out = []
-  var seen = {}
-
-  function walk(node) {
-    for (var i = 0; i < node.children.length && out.length < limit; i++) {
-      var child = node.children[i]
-      if (child.type === "text") continue
-      if (DROPPED_ELEMENTS[child.name] === true) continue
-      var style = attributeOf(child, "style")
-      var declarations = style !== null && style.value !== null && style.value !== undefined
-        ? splitDeclarations(style.value) : null
-      if (declarations !== null && VOID_ELEMENTS[child.name] !== true
-        && isHiddenBy(declarations)) continue
-      if (child.name === "img") {
-        var source = attributeValue(child, "src")
-        if (imageSourceKind(source) === "remote" && !isTrackingPixel(child)
-          && seen[source] !== true) {
-          seen[source] = true
-          out.push(source)
-        }
-      }
-      walk(child)
-    }
-  }
-
-  walk(root)
-  return out
-}
-
 // The sender centres a 600px card in the middle of a wide window. This reader
 // is a panel of left-aligned text beside a left-aligned list, and the same
 // mail kept centred in it comes out as a column of short lines adrift — the
@@ -1069,6 +1068,34 @@ function promoteImageDimensions(node, declarations) {
     var pixels = String(declaration.value).match(/^(\d+(?:\.\d+)?)px$/i)
     if (!pixels) continue
     setAttribute(node, declaration.name, pixels[1])
+  }
+}
+
+// The same promotion, for the same reason, on the other property Qt reads in
+// only one of its two spellings.
+//
+// Qt's rich text engine honours the `dir` attribute and ignores the CSS
+// `direction` property outright. A mail template written for a browser has no
+// reason to use the attribute — CSS is where a browser reads it — so an Arabic
+// or Hebrew newsletter that sets `style="direction:rtl"` arrives with its
+// direction stated in the one spelling the renderer does not look at, and is
+// laid out left-to-right against the wrong margin.
+//
+// The declaration is left in place rather than moved: it is the sender's, it is
+// correct, and something other than Qt may yet read this document.
+var DIRECTION_VALUES = { ltr: true, rtl: true }
+
+function promoteDirection(node, declarations) {
+  if (declarations === null) return
+  // The sender's own attribute wins. It is the more specific statement of the
+  // two, and it is the one they wrote for a client that reads it.
+  if (attributeOf(node, "dir") !== null) return
+  for (var i = 0; i < declarations.length; i++) {
+    if (declarations[i].name !== "direction") continue
+    var value = String(declarations[i].value).trim().toLowerCase()
+    if (DIRECTION_VALUES[value] !== true) continue
+    setAttribute(node, "dir", value)
+    return
   }
 }
 
@@ -1181,6 +1208,8 @@ function sanitize(html, options) {
   var blocked = 0
   var kept = 0
   var loadable = 0
+  var remoteSources = []
+  var seenRemoteSources = {}
 
   function preparedImage(source) {
     if (imageData === null || !Object.prototype.hasOwnProperty.call(imageData, source)) return ""
@@ -1237,14 +1266,25 @@ function sanitize(html, options) {
       // survives of its declarations are two questions about the same list.
       // Most elements in real mail carry one, so asking twice was most of a
       // second pass over the document.
-      var style = attributeOf(child, "style")
-      var declarations = style !== null && style.value !== null && style.value !== undefined
-        ? splitDeclarations(style.value)
-        : null
+      var declarations = sourceDeclarations(child)
       if (declarations !== null && VOID_ELEMENTS[child.name] !== true
         && isHiddenBy(declarations)) continue
 
+      // Collect fetch candidates while this walk already has the sender's
+      // unmodified attributes in hand. Keeping this before promotion and
+      // cleaning preserves the tracker and source rules without traversing
+      // the complete tree a second time.
+      if (child.name === "img" && remoteSources.length < limit) {
+        var remoteSource = attributeValue(child, "src")
+        if (imageSourceKind(remoteSource) === "remote" && !isTrackingPixel(child)
+          && seenRemoteSources[remoteSource] !== true) {
+          seenRemoteSources[remoteSource] = true
+          remoteSources.push(remoteSource)
+        }
+      }
+
       promoteImageDimensions(child, declarations)
+      promoteDirection(child, declarations)
       cleanAttributes(child, keepColors, declarations)
 
       if (child.name === "img" && !keepImage(child)) continue
@@ -1257,7 +1297,6 @@ function sanitize(html, options) {
   }
 
   var root = parse(source)
-  var remoteSources = readerRemoteImageSources(root, limit)
 
   // Read as text before anything is dropped, and only when a caller asked: the
   // reader wants both of these for a message with no text/plain part of its
@@ -1598,6 +1637,28 @@ function relaxFixedWidths(html, available) {
   return serialize(parse(html), fitting(false, false, true, available))
 }
 
+// Which way the document runs, said in the two spellings that have to agree.
+//
+// The stylesheets below are written in physical sides — Qt's rich text engine
+// reads `margin-left` and has never heard of `margin-inline-start` — so a list
+// indent, a quote bar and a header's alignment are each given a side when the
+// sheet is built. The `dir` on the body is the same statement in the other
+// spelling, and the two are written together or not at all.
+//
+// Separating them was tried and is wrong, visibly: a sheet that indents a list
+// from the right while the block is still left-to-right does not move the
+// bullet to the right, it drops the bullet altogether. Qt places a list marker
+// on the side the block runs from, and a margin alone does not tell it which
+// side that is.
+//
+// A base direction is a default, not an override. A sender who states `dir` on
+// their own element — or writes `direction` in CSS, which `promoteDirection`
+// turns into the same thing — still wins inside it, so this supplies an answer
+// only where the document gives none.
+function baseDirectionAttribute(palette) {
+  return Direction.attributeFor(String(palette.direction || ""))
+}
+
 // Wraps the sanitised body in a document. `colors` styles the parts the sender
 // did not: the ground, the default text, links and quoted replies.
 function documentFor(bodyHtml, colors) {
@@ -1610,6 +1671,9 @@ function documentFor(bodyHtml, colors) {
   // on a wrapper the sender's markup sits inside.
   var pad = Math.max(0, Math.floor(Number(palette.padding) || 0))
   var maxImage = Math.floor(Number(palette.maxImageWidth) || 0)
+  // Which way the message runs — see `baseDirectionAttribute` below.
+  var direction = String(palette.direction || "")
+  var quoteEdge = Direction.startEdge(direction)
 
   // No parse at all when the caller kept the document: this is rebuilt on every
   // relayout, and the body it is built from has not changed.
@@ -1624,10 +1688,14 @@ function documentFor(bodyHtml, colors) {
   return "<html><head><style type=\"text/css\">"
     + "body{color:" + foreground + ";background-color:" + background + ";}"
     + "a{color:" + link + ";}"
-    + "blockquote{color:" + quote + ";margin-left:8px;padding-left:8px;}"
+    // The quote rule indents from the side the text starts on. Qt reads only
+    // physical properties — there is no `margin-inline-start` in a
+    // QTextDocument — so the side is chosen here rather than by the renderer.
+    + "blockquote{color:" + quote + ";margin-" + quoteEdge + ":8px;padding-"
+      + quoteEdge + ":8px;}"
     + "td,th{padding:2px;}"
     + (maxImage >= MIN_IMAGE_WIDTH ? "img{max-width:" + maxImage + "px;}" : "")
-    + "</style></head><body>"
+    + "</style></head><body" + baseDirectionAttribute(palette) + ">"
     + (pad > 0 ? "<div style=\"padding:" + pad + "px\">" : "")
     + serialize(root, fit)
     + (pad > 0 ? "</div>" : "")
@@ -1918,7 +1986,7 @@ function readerHidden(node) {
   for (var i = 0; i < node.children.length; i++) {
     if (node.children[i].type !== "text") { leaf = false; break }
   }
-  return readerHiddenBy(splitDeclarations(style), leaf)
+  return readerHiddenBy(sourceDeclarations(node) || [], leaf)
 }
 
 // ------------------------------------------------------------- what it points at
@@ -1960,7 +2028,7 @@ function readerImageDimension(node, name) {
   var raw = attributeValue(node, name)
   var value = /^\s*\d+(?:\.\d+)?\s*$/.test(raw) ? Number(raw) : 0
   if (!(value > 0)) {
-    var declarations = splitDeclarations(attributeValue(node, "style"))
+    var declarations = sourceDeclarations(node) || []
     for (var i = 0; i < declarations.length; i++) {
       if (declarations[i].name !== name) continue
       var match = String(declarations[i].value).match(/^\s*(\d+(?:\.\d+)?)px\s*$/i)
@@ -2060,7 +2128,7 @@ function readerHeadingOf(node) {
   var style = attributeValue(node, "style")
   if (style === "") return ""
   if (style.toLowerCase().indexOf("font-size") < 0) return ""
-  var declarations = splitDeclarations(style)
+  var declarations = sourceDeclarations(node) || []
   var level = ""
   for (var i = 0; i < declarations.length; i++) {
     if (declarations[i].name !== "font-size") continue
@@ -2589,6 +2657,15 @@ function readerDocumentFor(source, colors) {
   // grows past it.
   var gap = Math.max(4, Math.round(base * 0.85))
   var rule = Math.max(2, Math.round(base * 0.5))
+  // Reading mode rebuilds the document, so every indent and every column in it
+  // is this file's own rather than the sender's — and every one of them is
+  // written as a physical side, because that is the only kind Qt reads. A
+  // right-to-left message read in a sheet whose lists indent from the left and
+  // whose headers align left is the sender's own layout problem reproduced by
+  // the view that exists to replace it.
+  var direction = String(palette.direction || "")
+  var startEdge = Direction.startEdge(direction)
+  var endEdge = Direction.endEdge(direction)
 
   return "<html><head><style type=\"text/css\">"
     + "body{color:" + foreground + ";background-color:" + background + ";}"
@@ -2605,16 +2682,19 @@ function readerDocumentFor(source, colors) {
     // Disable QTextDocument's own marker indent and provide one fixed
     // two-character column. Leaving both active doubled the indentation.
     + "ul,ol{margin-top:0px;margin-bottom:" + gap
-      + "px;margin-left:26px;-qt-list-indent:0;}"
+      + "px;margin-" + startEdge + ":26px;-qt-list-indent:0;}"
     + "li{margin-bottom:" + rule + "px;}"
-    + "blockquote{color:" + quote + ";margin-left:" + rule
-      + "px;padding-left:" + gap + "px;margin-top:0px;margin-bottom:" + gap + "px;}"
+    + "blockquote{color:" + quote + ";margin-" + startEdge + ":" + rule
+      + "px;padding-" + startEdge + ":" + gap
+      + "px;margin-top:0px;margin-bottom:" + gap + "px;}"
     + "pre{margin-top:0px;margin-bottom:" + gap + "px;}"
+    // The gutter goes after the cell's text, so a column keeps its gap from the
+    // next one along rather than from the one it has already passed.
     + "td,th{padding-top:" + rule + "px;padding-bottom:" + rule
-      + "px;padding-right:" + gap + "px;}"
-    + "th{font-weight:bold;text-align:left;}"
+      + "px;padding-" + endEdge + ":" + gap + "px;}"
+    + "th{font-weight:bold;text-align:" + startEdge + ";}"
     + (maxImage >= MIN_IMAGE_WIDTH ? "img{max-width:" + maxImage + "px;}" : "")
-    + "</style></head><body>"
+    + "</style></head><body" + baseDirectionAttribute(palette) + ">"
     + serialize(documentTree(source))
     + "</body></html>"
 }
@@ -2861,7 +2941,12 @@ function plainTextDocument(text, colors, linkImages) {
   return "<html><head><style type=\"text/css\">"
     + "body{color:" + foreground + ";background-color:" + background + ";}"
     + "a{color:" + link + ";}"
-    + "</style></head><body>" + body + "</body></html>"
+    // Plain text has no indent of its own to mirror, so the direction is the
+    // whole of what it takes. Qt resolves each line of a `<br>`-joined body
+    // separately either way; the base direction is what the lines with nothing
+    // strong in them fall back to.
+    + "</style></head><body" + baseDirectionAttribute(palette) + ">"
+    + body + "</body></html>"
 }
 
 // The index a marker link carries, or 0 when the link is something else.

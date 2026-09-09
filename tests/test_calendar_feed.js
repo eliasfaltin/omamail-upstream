@@ -156,6 +156,30 @@ assert.strictEqual(parsed[0].sourceId, "work")
 assert.strictEqual(parsed[0].href, "/cal/a.ics")
 assert.strictEqual(parsed[1].start.allDay, true)
 
+// A server may send the calendar object in a CDATA section instead of escaping
+// it, which RFC 4791 allows and DAViCal and iCloud do. Unwrapped, its first
+// line reads `<![CDATA[BEGIN:VCALENDAR` and the collection parses to nothing.
+const cdataXml = '<?xml version="1.0" encoding="UTF-8"?>'
+  + '<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">'
+  + '<d:response><d:href>/cal/cdata.ics</d:href><d:propstat>'
+  + '<d:prop><d:getetag>"C=1@U=cdata"</d:getetag>'
+  + '<c:calendar-data><![CDATA[BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:cdata\r\nSUMMARY:R&D sync &amp; Q&A\r\nDTSTART:20260824T080000Z\r\nDTEND:20260824T083000Z\r\nEND:VEVENT\r\nEND:VCALENDAR]]></c:calendar-data>'
+  + '</d:prop><d:status>HTTP/1.1 200 OK</d:status>'
+  + '</d:propstat></d:response></d:multistatus>'
+const cdataParsed = feed.eventsFromCaldav(cdataXml, "work")
+assert.strictEqual(cdataParsed.length, 1)
+assert.strictEqual(cdataParsed[0].href, "/cal/cdata.ics")
+// Nothing inside a CDATA section is escaped, so the entity pass must not touch
+// it: "&amp;" there is those five characters and a summary keeps them.
+assert.strictEqual(cdataParsed[0].summary, "R&D sync &amp; Q&A")
+
+// Both encodings can appear in one element. The entities outside the section
+// are decoded; the section's own content is handed over exactly as it arrived.
+assert.strictEqual(
+  feed.tagText('<c:calendar-data>A &amp; B&#13;<![CDATA[C &amp; D]]>'
+    + ' &lt;end&gt;</c:calendar-data>', "calendar-data"),
+  "A & B\rC &amp; D <end>")
+
 const recurringXml = [
   '<?xml version="1.0"?>',
   '<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">',
@@ -257,25 +281,6 @@ assert.deepStrictEqual(JSON.parse(JSON.stringify(created.google)), {
   start: { dateTime: "2026-08-24T08:00:00.000Z" },
   end: { dateTime: "2026-08-24T09:00:00.000Z" }
 })
-
-const imported = feed.importInvitation({
-  uid: "meeting@example.com", sequence: 3, summary: "Invited meeting",
-  description: "Agenda", location: "Room 4",
-  start: { ms: Date.UTC(2026, 7, 24, 8, 0), allDay: false },
-  end: { ms: Date.UTC(2026, 7, 24, 9, 0), allDay: false },
-  recurrenceRule: "FREQ=WEEKLY;INTERVAL=1"
-}, 5678)
-assert.strictEqual(imported.ok, true)
-assert.strictEqual(imported.uid, "meeting@example.com")
-assert.ok(imported.ics.indexOf("UID:meeting@example.com") > 0,
-  "an imported invitation keeps its identity for idempotent CalDAV writes")
-assert.ok(imported.ics.indexOf("SEQUENCE:3") > 0)
-assert.ok(imported.ics.indexOf("RRULE:FREQ=WEEKLY;INTERVAL=1") > 0)
-assert.ok(imported.ics.indexOf("SUMMARY:Invited meeting") > 0)
-assert.strictEqual("google" in imported, false,
-  "an IMAP invitation import builds no unused Google Calendar request")
-assert.strictEqual(feed.importInvitation({ uid: "x", summary: "No time" }, 1).error,
-  "The invitation has no complete event time")
 
 const recurring = feed.createEvent({
   title: "Planning", startMs: Date.UTC(2026, 7, 24, 8, 0),
